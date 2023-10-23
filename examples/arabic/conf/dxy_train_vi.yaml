@@ -1,0 +1,83 @@
+accum_grad: 1
+cmvn_file: null
+dataset_conf:
+  batch_conf:
+    batch_type: dynamic # 不固定每个 batch 的 sample 数，而是计算放到 batch 的所有 sample 累积的帧数（窗口数）
+    max_frames_in_batch: 80000 # 好处在于能够精确控制每次输入的数据不会超过某个量，而不会因为某个 sample 太大导致出现 OOM
+  filter_conf:
+    max_length: 4096 # utterance 最长持续时间，40.96s
+    min_length: 50 # utterance 最短持续时间，0.5s
+    token_max_length: 200 # label 的 token 数量在 1~200 之间
+    token_min_length: 1
+  feats_type: mfcc # 指定用什么特征，fbank 或 mfcc
+  mfcc_conf:
+    dither: 0.1
+    frame_length: 25 # 窗口长度，25ms * 16 sample/ms = 400 samples
+    frame_shift: 10 # 窗口间隔，10ms * 16 sample/ms = 160 samples
+    high_freq: -400
+    low_freq: 20
+    num_ceps: 40
+    num_mel_bins: 40 # mfcc 特征维度
+  resample_conf:
+    resample_rate: 16000 # 如果读到的语音数据采样率不是 16KHz，则以 16KHz 重采样
+  shuffle: true # 以 self.epoch 为种子对全部数据做 shuffle
+  shuffle_conf:
+    shuffle_size: 1500 # 从全部数据里面每读取 1500 条数据再做一下 shuffle
+  sort: true # sort 发生在 shuffle 之后，从 1500 条数据里面每取 500 条数据根据帧数（窗口数）进行排序，让每个 batch 里面的数据大小差不多
+  sort_conf:
+    sort_size: 500
+  spec_aug: false
+  spec_aug_conf:
+    max_f: 10
+    max_t: 50
+    num_f_mask: 2
+    num_t_mask: 2
+  speed_perturb: false
+  split_with_space: true # 如果没有 bpe model，就用空格对句子进行分割
+decoder: transformer
+decoder_conf:
+  attention_heads: 4
+  dropout_rate: 0.1
+  linear_units: 1024
+  num_blocks: 1
+  positional_dropout_rate: 0.0
+  self_attention_dropout_rate: 0.0
+  src_attention_dropout_rate: 0.0
+encoder: conformer
+encoder_conf:
+  activation_type: swish
+  attention_dropout_rate: 0.0
+  attention_heads: 8
+  cnn_module_kernel: 15
+  cnn_module_norm: layer_norm
+  # concat_after: true
+  dropout_rate: 0.1
+  input_layer: conv2d6
+  linear_units: 2048
+  macaron_style: true 
+  normalize_before: true
+  num_blocks: 24
+  output_size: 512
+  pos_enc_layer_type: rel_pos
+  positional_dropout_rate: 0.0
+  selfattention_layer_type: rel_selfattn
+  use_cnn_module: true
+  use_dynamic_chunk: true
+  use_dynamic_left_chunk: false
+grad_clip: 5
+input_dim: 40
+is_json_cmvn: true
+log_interval: 100
+max_epoch: 300
+model_conf:
+  ctc_weight: 0.7
+  length_normalized_loss: false
+  lsm_weight: 0.1
+optim: adam
+optim_conf:
+  lr: 0.0001
+output_dim: 6158
+raw_wav: true
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 10000
