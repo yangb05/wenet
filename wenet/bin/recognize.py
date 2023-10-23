@@ -23,7 +23,7 @@ import sys
 import torch
 import yaml
 from torch.utils.data import DataLoader
-
+sys.path.append('/mgData2/yangb/wenet')
 from wenet.dataset.dataset import Dataset
 from wenet.paraformer.search.beam_search import build_beam_search
 from wenet.utils.checkpoint import load_checkpoint
@@ -207,7 +207,7 @@ def main():
                            non_lang_syms,
                            partition=False)
 
-    test_data_loader = DataLoader(test_dataset, batch_size=None, num_workers=0)
+    test_data_loader = DataLoader(test_dataset, batch_size=None, num_workers=20)
 
     # Init asr model from configs
     model = init_model(configs)

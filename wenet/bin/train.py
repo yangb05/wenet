@@ -32,7 +32,8 @@ from deepspeed.runtime.zero.stage3 import estimate_zero3_model_states_mem_needs_
 from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
-
+import sys
+sys.path.append('/mgData2/yangb/wenet')
 from wenet.dataset.dataset import Dataset
 from wenet.utils.checkpoint import (load_checkpoint, save_checkpoint,
                                     load_trained_modules)
@@ -308,7 +309,7 @@ def main():
         # cuda model is required for nn.parallel.DistributedDataParallel
         model.cuda()
         model = torch.nn.parallel.DistributedDataParallel(
-            model, find_unused_parameters=True)
+            model, find_unused_parameters=False)
         device = torch.device("cuda")
         if args.fp16_grad_sync:
             from torch.distributed.algorithms.ddp_comm_hooks import (
