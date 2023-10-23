@@ -10,14 +10,10 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 stage=0 # start from 0 if you need to start from data preparation
 stop_stage=5
 
-# The num of nodes or machines used for multi-machine training
-# Default 1 for single machine/node
-# NFS will be needed if you want run multi-machine training
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
-# The rank of each node or machine, range from 0 to num_nodes -1
-# The first node/machine sets node_rank 0, the second one sets node_rank 1
-# the third one set node_rank 2, and so on. Default 0
-node_rank=0
 
 # data
 # use your own data path, you can contact gigaspeech@speechcolab.orgfor getting data for data information about gigaspeech
@@ -142,25 +138,14 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
   dist_backend="nccl"
-  # The total number of processes/gpus, so that the master knows
-  # how many workers to wait for.
-  # More details about ddp can be found in
-  # https://pytorch.org/tutorials/intermediate/dist_tuto.html
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
   cmvn_opts=
   $cmvn && cp ${feat_dir}/${train_set}/global_cmvn $dir
   $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
   # train.py will write $train_config to $dir/train.yaml with model input
   # and output dimension, train.yaml will be used for inference or model
   # export later
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+    wenet/bin/train.py \
       --config $train_config \
       --data_type "shard" \
       --symbol_table $dict \
@@ -170,14 +155,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
       --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       --num_workers 16 \
       $cmvn_opts
-  } &
-  done
-  wait
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -199,58 +179,46 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   # -1 for full chunk
   decoding_chunk_size=
   ctc_weight=0.5
-  # Polling GPU id begin with index 0
-  num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
-  idx=0
   for test in $recog_set; do
-    for mode in ${decode_modes}; do
-    {
-      {
-        test_dir=$dir/${test}_${mode}
-        mkdir -p $test_dir
-        gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$idx+1])
-        python wenet/bin/recognize.py --gpu $gpu_id \
-          --mode $mode \
-          --config $dir/train.yaml \
-          --data_type "shard" \
-          --bpe_model $bpemodel.model \
-          --test_data $data/$test/format.data \
-          --checkpoint $decode_checkpoint \
-          --beam_size 20 \
-          --batch_size 1 \
-          --penalty 0.0 \
-          --dict $dict \
-          --result_file $test_dir/text_bpe \
-          --ctc_weight $ctc_weight \
-          ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+  {
+    result_dir=$dir/${test}
+    python wenet/bin/recognize.py --gpu 0 \
+      --modes $decode_modes \
+      --config $dir/train.yaml \
+      --data_type "shard" \
+      --bpe_model $bpemodel.model \
+      --test_data $data/$test/format.data \
+      --checkpoint $decode_checkpoint \
+      --beam_size 20 \
+      --batch_size 32 \
+      --penalty 0.0 \
+      --dict $dict \
+      --result_dir $result_dir \
+      --ctc_weight $ctc_weight \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
 
-        cut -f2- -d " " $test_dir/text_bpe > $test_dir/text_bpe_value_tmp
-        cut -f1 -d " " $test_dir/text_bpe > $test_dir/text_bpe_key_tmp
+    for mode in $decode_modes; do
+      test_dir=$result_dir/$mode
+      cp $test_dir/text $test_dir/text_bpe
+      cut -f2- -d " " $test_dir/text_bpe > $test_dir/text_bpe_value_tmp
+      cut -f1 -d " " $test_dir/text_bpe > $test_dir/text_bpe_key_tmp
 
-        tools/spm_decode --model=${bpemodel}.model --input_format=piece \
-          < $test_dir/text_bpe_value_tmp | sed -e "s/▁/ /g" > $test_dir/text_value
-        paste -d " " $test_dir/text_bpe_key_tmp $test_dir/text_value > $test_dir/text
-        # a raw version wer without refining processs
-        python tools/compute-wer.py --char=1 --v=1 \
-          $data/$test/text $test_dir/text > $test_dir/wer
+      tools/spm_decode --model=${bpemodel}.model --input_format=piece \
+        < $test_dir/text_bpe_value_tmp | sed -e "s/▁/ /g" > $test_dir/text_value
+      paste -d " " $test_dir/text_bpe_key_tmp $test_dir/text_value > $test_dir/text
+      # a raw version wer without refining processs
+      python tools/compute-wer.py --char=1 --v=1 \
+        $data/$test/text $test_dir/text > $test_dir/wer
 
-        # for gigaspeech scoring
-        cat $test_dir/text_bpe_key_tmp | sed -e "s/^/(/g" | sed -e "s/$/)/g" > $test_dir/hyp_key
-        paste -d " " $test_dir/text_value $test_dir/hyp_key > $test_dir/hyp
-        paste -d " " <(cut -f2- -d " " $data/$test/text) \
-          <(cut -f1 -d " " $data/$test/text | \
-          sed -e "s/^/(/g" | sed -e "s/$/)/g") > $data/$test/ref
-        local/gigaspeech_scoring.py $data/$test/ref $test_dir/hyp $test_dir
-      } &
-
-      ((idx+=1))
-      if [ $idx -eq $num_gpus ]; then
-        idx=0
-      fi
-    }
+      # for gigaspeech scoring
+      cat $test_dir/text_bpe_key_tmp | sed -e "s/^/(/g" | sed -e "s/$/)/g" > $test_dir/hyp_key
+      paste -d " " $test_dir/text_value $test_dir/hyp_key > $test_dir/hyp
+      paste -d " " <(cut -f2- -d " " $data/$test/text) \
+        <(cut -f1 -d " " $data/$test/text | \
+        sed -e "s/^/(/g" | sed -e "s/$/)/g") > $data/$test/ref
+      local/gigaspeech_scoring.py $data/$test/ref $test_dir/hyp $test_dir
     done
-  done
-  wait
+  }
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then

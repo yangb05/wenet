@@ -6,22 +6,15 @@
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
+
 stage=0 # start from 0 if you need to start from data preparation
 stop_stage=5
 
-# The num of machines(nodes) for multi-machine training, 1 is for one machine.
-# NFS is required if num_nodes > 1.
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
 
-# The rank of each node or machine, which ranges from 0 to `num_nodes - 1`.
-# You should set the node_rank=0 on the first machine, set the node_rank=1
-# on the second machine, and so on.
-node_rank=0
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relatvie path!
 data=/export/data/asr-data/OpenSLR/33/
@@ -128,8 +121,6 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
   dist_backend="nccl"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
   cmvn_opts=
   $cmvn && cp data/${train_set}/global_cmvn $dir
   $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
@@ -165,13 +156,8 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         --pin_memory
   else
     echo "using torch ddp"
-    for ((i = 0; i < $num_gpus; ++i)); do
-    {
-      gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-      # Rank of each gpu/process used for knowing whether it is
-      # the master of a worker.
-      rank=`expr $node_rank \* $num_gpus + $i`
-      python wenet/bin/train.py --gpu $gpu_id \
+    torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+      wenet/bin/train.py \
         --config $train_config \
         --data_type $data_type \
         --symbol_table $dict \
@@ -180,16 +166,11 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         ${checkpoint:+--checkpoint $checkpoint} \
         --model_dir $dir \
         --ddp.init_method $init_method \
-        --ddp.world_size $world_size \
-        --ddp.rank $rank \
         --ddp.dist_backend $dist_backend \
         --num_workers ${num_workers} \
         --prefetch ${prefetch} \
         $cmvn_opts \
         --pin_memory
-    } &
-    done
-    wait
   fi
 fi
 
@@ -210,29 +191,24 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   decoding_chunk_size=
   ctc_weight=0.3
   reverse_weight=0.5
+  python wenet/bin/recognize.py --gpu 0 \
+    --modes $decode_modes \
+    --config $dir/train.yaml \
+    --data_type $data_type \
+    --test_data data/test/data.list \
+    --checkpoint $decode_checkpoint \
+    --beam_size 10 \
+    --batch_size 32 \
+    --penalty 0.0 \
+    --dict $dict \
+    --ctc_weight $ctc_weight \
+    --reverse_weight $reverse_weight \
+    --result_dir $dir \
+    ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
   for mode in ${decode_modes}; do
-  {
-    test_dir=$dir/test_${mode}
-    mkdir -p $test_dir
-    python wenet/bin/recognize.py --gpu 0 \
-      --mode $mode \
-      --config $dir/train.yaml \
-      --data_type $data_type \
-      --test_data data/test/data.list \
-      --checkpoint $decode_checkpoint \
-      --beam_size 10 \
-      --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
-      --ctc_weight $ctc_weight \
-      --reverse_weight $reverse_weight \
-      --result_file $test_dir/text \
-      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
     python tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/text > $test_dir/wer
-  } &
+      data/test/text $dir/$mode/text > $dir/$mode/wer
   done
-  wait
 fi
 
 
@@ -296,30 +272,27 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
   lm_scale=0.7
   decoder_scale=0.1
   r_decoder_scale=0.7
-  for mode in hlg_onebest hlg_rescore; do
-  {
-    test_dir=$dir/test_${mode}
-    mkdir -p $test_dir
-    python wenet/bin/recognize.py --gpu 0 \
-      --mode $mode \
-      --config $dir/train.yaml \
-      --data_type $data_type \
-      --test_data data/test/data.list \
-      --checkpoint $decode_checkpoint \
-      --beam_size 10 \
-      --batch_size 16 \
-      --penalty 0.0 \
-      --dict $dict \
-      --word data/local/hlg/words.txt \
-      --hlg data/local/hlg/HLG.pt \
-      --lm_scale $lm_scale \
-      --decoder_scale $decoder_scale \
-      --r_decoder_scale $r_decoder_scale \
-      --result_file $test_dir/text \
-      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+  decode_modes="hlg_onebest hlg_rescore"
+  python wenet/bin/recognize.py --gpu 0 \
+    --modes $decode_modes \
+    --config $dir/train.yaml \
+    --data_type $data_type \
+    --test_data data/test/data.list \
+    --checkpoint $decode_checkpoint \
+    --beam_size 10 \
+    --batch_size 16 \
+    --penalty 0.0 \
+    --dict $dict \
+    --word data/local/hlg/words.txt \
+    --hlg data/local/hlg/HLG.pt \
+    --lm_scale $lm_scale \
+    --decoder_scale $decoder_scale \
+    --r_decoder_scale $r_decoder_scale \
+    --result_dir $dir \
+    ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
+  for mode in ${decode_modes}; do
     python tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/text > $test_dir/wer
-  }
+      data/test/text $dir/$mode/text > $dir/$mode/wer
   done
 fi
 

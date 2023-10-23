@@ -43,14 +43,25 @@ def pad_list(xs: List[torch.Tensor], pad_value: int):
                 [1., 0., 0., 0.]])
 
     """
-    n_batch = len(xs)
-    max_len = max([x.size(0) for x in xs])
-    pad = torch.zeros(n_batch, max_len, dtype=xs[0].dtype, device=xs[0].device)
-    pad = pad.fill_(pad_value)
-    for i in range(n_batch):
-        pad[i, :xs[i].size(0)] = xs[i]
-
-    return pad
+    max_len = max([len(item) for item in xs])
+    batchs = len(xs)
+    ndim = xs[0].ndim
+    if ndim == 1:
+        pad_res = torch.zeros(batchs, max_len,
+                              dtype=xs[0].dtype, device=xs[0].device)
+    elif ndim == 2:
+        pad_res = torch.zeros(batchs, max_len, xs[0].shape[1],
+                              dtype=xs[0].dtype, device=xs[0].device)
+    elif ndim == 3:
+        pad_res = torch.zeros(batchs, max_len, xs[0].shape[1],
+                              xs[0].shape[2], dtype=xs[0].dtype,
+                              device=xs[0].device)
+    else:
+        raise ValueError(f"Unsupported ndim: {ndim}")
+    pad_res.fill_(pad_value)
+    for i in range(batchs):
+        pad_res[i, :len(xs[i])] = xs[i]
+    return pad_res
 
 
 def add_blank(ys_pad: torch.Tensor, blank: int,
@@ -221,32 +232,8 @@ def get_subsample(config):
         return 8
 
 
-def remove_duplicates_and_blank(hyp: List[int]) -> List[int]:
-    new_hyp: List[int] = []
-    cur = 0
-    while cur < len(hyp):
-        if hyp[cur] != 0:
-            new_hyp.append(hyp[cur])
-        prev = cur
-        while cur < len(hyp) and hyp[cur] == hyp[prev]:
-            cur += 1
-    return new_hyp
 
-
-def replace_duplicates_with_blank(hyp: List[int]) -> List[int]:
-    new_hyp: List[int] = []
-    cur = 0
-    while cur < len(hyp):
-        new_hyp.append(hyp[cur])
-        prev = cur
-        cur += 1
-        while cur < len(hyp) and hyp[cur] == hyp[prev] and hyp[cur] != 0:
-            new_hyp.append(0)
-            cur += 1
-    return new_hyp
-
-
-def log_add(args: List[int]) -> float:
+def log_add(*args) -> float:
     """
     Stable log add
     """

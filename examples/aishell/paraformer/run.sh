@@ -6,22 +6,14 @@
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
-# The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
-# communication. More details can be found in
-# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
-# export NCCL_SOCKET_IFNAME=ens4f1
-export NCCL_DEBUG=INFO
 stage=0 # start from 0 if you need to start from data preparation
 stop_stage=5
 
-# The num of machines(nodes) for multi-machine training, 1 is for one machine.
-# NFS is required if num_nodes > 1.
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
 
-# The rank of each node or machine, which ranges from 0 to `num_nodes - 1`.
-# You should set the node_rank=0 on the first machine, set the node_rank=1
-# on the second machine, and so on.
-node_rank=0
 # The aishell dataset location, please change this to your own path
 # make sure of using absolute path. DO-NOT-USE relative path!
 data=/export/data/asr-data/OpenSLR/33/
@@ -120,8 +112,6 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
   dist_backend="gloo"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
   cmvn_opts=
   $cmvn && cp data/${train_set}/global_cmvn $dir
   $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
@@ -129,13 +119,8 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # train.py rewrite $train_config to $dir/train.yaml with model input
   # and output dimension, and $dir/train.yaml will be used for inference
   # and export.
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python3 wenet/bin/train.py --gpu $gpu_id \
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+    wenet/bin/train.py \
       --config $train_config \
       --data_type $data_type \
       --symbol_table $dict \
@@ -143,16 +128,10 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       --cv_data data/test/data.list \
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
-      --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       --num_workers 8 \
       $cmvn_opts \
       --pin_memory
-  } &
-  done
-  wait
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -172,29 +151,24 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   decoding_chunk_size=
   ctc_weight=0.5
   reverse_weight=0.0
+  python wenet/bin/recognize.py --gpu 0 \
+    --modes $decode_modes \
+    --config $dir/train.yaml \
+    --data_type $data_type \
+    --test_data data/test/data.list \
+    --checkpoint $decode_checkpoint \
+    --beam_size 10 \
+    --batch_size 32 \
+    --penalty 0.0 \
+    --dict $dict \
+    --ctc_weight $ctc_weight \
+    --reverse_weight $reverse_weight \
+    --result_dir $dir \
+    ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
   for mode in ${decode_modes}; do
-  {
-    test_dir=$dir/test_${mode}
-    mkdir -p $test_dir
-    python3 wenet/bin/recognize.py --gpu 0 \
-      --mode $mode \
-      --config $dir/train.yaml \
-      --data_type $data_type \
-      --test_data data/test/data.list \
-      --checkpoint $decode_checkpoint \
-      --beam_size 10 \
-      --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
-      --ctc_weight $ctc_weight \
-      --reverse_weight $reverse_weight \
-      --result_file $test_dir/text \
-      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
-    python3 tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/text > $test_dir/wer
-  } &
+    python tools/compute-wer.py --char=1 --v=1 \
+      data/test/text $dir/$mode/text > $dir/$mode/wer
   done
-  wait
 fi
 
 
@@ -206,82 +180,3 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     --output_file $dir/final.zip \
     --output_quant_file $dir/final_quant.zip
 fi
-
-# Optionally, you can add LM and test it with runtime.
-if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
-  # 7.1 Prepare dict
-  unit_file=$dict
-  mkdir -p data/local/dict
-  cp $unit_file data/local/dict/units.txt
-  tools/fst/prepare_dict.py $unit_file ${data}/resource_aishell/lexicon.txt \
-    data/local/dict/lexicon.txt
-  # 7.2 Train lm
-  lm=data/local/lm
-  mkdir -p $lm
-  tools/filter_scp.pl data/train/text \
-    $data/data_aishell/transcript/aishell_transcript_v0.8.txt > $lm/text
-  local/aishell_train_lms.sh
-  # 7.3 Build decoding TLG
-  tools/fst/compile_lexicon_token_fst.sh \
-    data/local/dict data/local/tmp data/local/lang
-  tools/fst/make_tlg.sh data/local/lm data/local/lang data/lang_test || exit 1;
-  # 7.4 Decoding with runtime
-  chunk_size=-1
-  ./tools/decode.sh --nj 16 \
-    --beam 15.0 --lattice_beam 7.5 --max_active 7000 \
-    --blank_skip_thresh 0.98 --ctc_weight 0.5 --rescoring_weight 1.0 \
-    --chunk_size $chunk_size \
-    --fst_path data/lang_test/TLG.fst \
-    --dict_path data/lang_test/words.txt \
-    data/test/wav.scp data/test/text $dir/final.zip \
-    data/lang_test/units.txt $dir/lm_with_runtime
-  # Please see $dir/lm_with_runtime for wer
-fi
-
-# Optionally, you can decode with k2 hlg
-if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
-  if [ ! -f data/local/lm/lm.arpa ]; then
-    echo "Please run prepare dict and train lm in Stage 7" || exit 1;
-  fi
-
-  # 8.1 Build decoding HLG
-  required="data/local/hlg/HLG.pt data/local/hlg/words.txt"
-  for f in $required; do
-    if [ ! -f $f ]; then
-      tools/k2/make_hlg.sh data/local/dict/ data/local/lm/ data/local/hlg
-      break
-    fi
-  done
-
-  # 8.2 Decode using HLG
-  decoding_chunk_size=
-  lm_scale=0.7
-  decoder_scale=0.1
-  r_decoder_scale=0.7
-  for mode in hlg_onebest hlg_rescore; do
-  {
-    test_dir=$dir/test_${mode}
-    mkdir -p $test_dir
-    python3 wenet/bin/recognize.py --gpu 0 \
-      --mode $mode \
-      --config $dir/train.yaml \
-      --data_type $data_type \
-      --test_data data/test/data.list \
-      --checkpoint $decode_checkpoint \
-      --beam_size 10 \
-      --batch_size 16 \
-      --penalty 0.0 \
-      --dict $dict \
-      --word data/local/hlg/words.txt \
-      --hlg data/local/hlg/HLG.pt \
-      --lm_scale $lm_scale \
-      --decoder_scale $decoder_scale \
-      --r_decoder_scale $r_decoder_scale \
-      --result_file $test_dir/text \
-      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
-    python3 tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/text > $test_dir/wer
-  }
-  done
-fi
-

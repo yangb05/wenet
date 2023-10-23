@@ -11,10 +11,10 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 stage=0
 stop_stage=5
 
-# The num of nodes
+# You should change the following two parameters for multiple machine training,
+# see https://pytorch.org/docs/stable/elastic/run.html
+HOST_NODE_ADDR="localhost:0"
 num_nodes=1
-# The rank of current node
-node_rank=0
 
 # Use your own data path. You need to download the WenetSpeech dataset by yourself.
 wenetspeech_data_dir=/ssd/nfs07/binbinzhang/wenetspeech
@@ -119,21 +119,14 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
   dist_backend="nccl"
-  world_size=`expr $num_gpus \* $num_nodes`
-  echo "total gpus is: $world_size"
   cmvn_opts=
   $cmvn && cp data/${train_set}/global_cmvn $dir
   $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
   # train.py will write $train_config to $dir/train.yaml with model input
   # and output dimension, train.yaml will be used for inference or model
   # export later
-  for ((i = 0; i < $num_gpus; ++i)); do
-  {
-    gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
-    # Rank of each gpu/process used for knowing whether it is
-    # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
-    python wenet/bin/train.py --gpu $gpu_id \
+  torchrun --nnodes=$num_nodes --nproc_per_node=$num_gpus --rdzv_endpoint=$HOST_NODE_ADDR \
+    wenet/bin/train.py \
       --config $train_config \
       --data_type "shard" \
       --symbol_table $dict \
@@ -142,15 +135,10 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       ${checkpoint:+--checkpoint $checkpoint} \
       --model_dir $dir \
       --ddp.init_method $init_method \
-      --ddp.world_size $world_size \
-      --ddp.rank $rank \
       --ddp.dist_backend $dist_backend \
       $cmvn_opts \
       --num_workers 8 \
       --pin_memory
-  } &
-  done
-  wait
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
@@ -171,32 +159,27 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   reverse_weight=0.0
   for testset in ${test_sets} ${dev_set}; do
   {
+    base=$(basename $decode_checkpoint)
+    result_dir=$dir/${testset}_${base}
+    python wenet/bin/recognize.py --gpu 0 \
+      --modes $decode_modes \
+      --config $dir/train.yaml \
+      --data_type "shard" \
+      --test_data data/$testset/data.list \
+      --checkpoint $decode_checkpoint \
+      --beam_size 10 \
+      --batch_size 1 \
+      --penalty 0.0 \
+      --dict $dict \
+      --ctc_weight $ctc_weight \
+      --reverse_weight $reverse_weight \
+      --result_dir $result_dir \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
     for mode in ${decode_modes}; do
-    {
-      base=$(basename $decode_checkpoint)
-      result_dir=$dir/${testset}_${mode}_${base}
-      mkdir -p $result_dir
-      python wenet/bin/recognize.py --gpu 0 \
-        --mode $mode \
-        --config $dir/train.yaml \
-        --data_type "shard" \
-        --test_data data/$testset/data.list \
-        --checkpoint $decode_checkpoint \
-        --beam_size 10 \
-        --batch_size 1 \
-        --penalty 0.0 \
-        --dict $dict \
-        --ctc_weight $ctc_weight \
-        --reverse_weight $reverse_weight \
-        --result_file $result_dir/text \
-        ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
       python tools/compute-wer.py --char=1 --v=1 \
-        data/$testset/text $result_dir/text > $result_dir/wer
-    }
+        data/$testset/text $result_dir/$mode/text > $result_dir/$mode/wer
     done
-    wait
   }
-  done
 fi
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
